@@ -1,0 +1,172 @@
+# action.yml
+
+name: vmspawn
+description: "Action that spawns a kcli VM"
+inputs:
+  kcli_key:
+    description: "SSH key"
+    required: true
+  script:
+    description: "Script to execute"
+    required: true
+  vm_profile:
+    description: "Script to execute"
+    required: false
+    default: "ubuntuthin"
+
+runs:
+    using: 'composite'
+    steps:
+
+    - name: get & install kcli
+      id: kcli-install
+      shell: bash
+      run: |
+        curl -s https://raw.githubusercontent.com/karmab/kcli/main/install.sh | bash
+
+    - name: 'Setup yq'
+      uses: dcarbone/install-yq-action@v1.1.1
+      #with:
+      #  version: '${{ inputs.version }}'
+      #  download-compressed: '${{ inputs.download-compressed }}'
+      #  force: '${{ inputs.force }}'
+
+    - name: 'Check yq'
+      shell: bash
+      run: |
+          which yq
+          yq --version
+    - name:  pre-spawn preparatory actions
+      id: prespawn-prep-actions
+      shell: bash
+      run: |
+        mkdir -p $HOME/.kcli
+        cp ${{ github.action_path }}/profiles.yml $HOME/.kcli
+        cp ${{ github.action_path }}/config.yml $HOME/.kcli
+        ssh-keygen -N "" -f ~/.ssh/${{ github.run_id }}_ubuntu
+        yq -i e '.ubuntuthin.keys |= ["~/.ssh/${{ github.run_id }}_ubuntu.pub"]' $HOME/.kcli/profiles.yml
+        yq -i e '.ubuntufat.keys |= ["~/.ssh/${{ github.run_id }}_ubuntu.pub"]' $HOME/.kcli/profiles.yml
+        echo "${{ inputs.kcli_key }}" > $HOME/.ssh/id_rsa_kcli_${{ github.run_id }}
+        chmod 600 $HOME/.ssh/id_rsa_kcli_${{ github.run_id }}
+        echo "starting agent...."
+        ssh_agent_eval=$(eval `ssh-agent -a /tmp/${{ github.run_id }}.sock` && ssh-add $HOME/.ssh/${{ github.run_id }}_ubuntu && ssh-add $HOME/.ssh/id_rsa_kcli_${{ github.run_id }} )
+        ssh_agent_pid=$(echo $ssh_agent_eval | awk '{print $3;}')
+        echo "SSH_AGENT_PID=$ssh_agent_pid" >> $GITHUB_ENV
+
+    - name: spawn VM
+      id: spawn-vm
+      shell: bash
+      env:
+        SSH_AUTH_SOCK: /tmp/${{ github.run_id }}.sock
+      run: |
+        vm_client=$(yq '.${{ inputs.vm_profile}}.client'  $HOME/.kcli/profiles.yml)
+        kcli -c $vm_client list vm
+        kcli -c $vm_client create vm -p ${{ inputs.vm_profile }} ${{ inputs.vm_profile }}_${{ github.run_id }}
+        echo "get spanwed vm info"
+        output="fail"
+        result="fail"
+        count=1
+        while [[ $result != "success" ]]
+        do
+          echo "inside while loop"
+          echo "output: " $output
+          echo "result: " $result
+          sleep $(($count * 10))
+          echo "count:" $count
+          output=$(kcli -c $vm_client list vm | grep  ${{ inputs.vm_profile }}_${{ github.run_id }} | cut -d '|' -f '4' | sed 's/ //g')
+          if [[ "$output" =~ ^[0-9]{1,3}\.[0-9]{1,3}.* ]]; then result="success"; fi
+          if (( count == 5 )); then echo "max VM spawner polling iterations reached, exiting with failure" && exit 1; fi
+          (( count++ ))
+          echo "============================="
+          echo "output: " $output
+          echo "result: " $result
+          echo "count:" $count
+        done
+        echo "vm_spawn_result=$result" >> $GITHUB_ENV
+        echo "vm_spawn_ip=$output" >> $GITHUB_ENV
+        
+
+
+    - name: Execute script in vm
+      id: script-execute-vm
+      shell: bash
+      env:
+        SSH_AUTH_SOCK: /tmp/${{ github.run_id }}.sock
+      run: |
+        if [[ $vm_spawn_result == "success" ]]; then
+          ssh -oStrictHostKeyChecking=no root@$vm_spawn_ip uname -a;
+          uname_output=$(ssh -oStrictHostKeyChecking=no ubuntu@$vm_spawn_ip uname -a)
+          echo "vm_uname=$uname_output" >> $GITHUB_ENV
+        else
+          exit 1
+        fi
+  
+    - name: Run script in VM
+      id: test-script
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        SSH_AUTH_SOCK: /tmp/${{ github.run_id }}.sock
+      run: |
+        if [[ $vm_spawn_result == "success" ]]; then
+          ssh -oStrictHostKeyChecking=no root@$vm_spawn_ip "${{ inputs.script }}"
+        else
+          exit 1
+        fi
+
+    - name: Post execution cleanup
+      if: ${{ !cancelled() }}
+      id: post-cleanup
+      shell: bash
+      env:
+        SSH_AUTH_SOCK: /tmp/${{ github.run_id }}.sock
+      run: |
+        echo "get vm shutdown flag from profile"
+        shutdown_flag=$(yq '.${{ inputs.vm_profile}}.shutdown_flag'  $HOME/.kcli/profiles.yml)
+        vm_client=$(yq '.${{ inputs.vm_profile}}.client'  $HOME/.kcli/profiles.yml)
+        echo "shutdown flag:" $shutdown_flag
+        echo "vm client: " $vm_client
+        if [[ $shutdown_flag == "true" ]]; then
+          echo "cleaning up VM"
+          rm $HOME/.ssh/${{ github.run_id }}_ubuntu*
+          echo "y" | kcli -c $vm_client delete vm ${{ inputs.vm_profile }}_${{ github.run_id }}
+        else
+          echo "will leave VM running, check job artifacts"
+        fi
+        echo "clean ssh-agent"
+        echo "ssh agent pid: " $SSH_AGENT_PID
+        ssh-agent -k
+        echo "clean kcli ssh keys"
+        sudo rm -rf $HOME/.ssh/id_rsa_kcli_${{ github.run_id }}
+        ssh-keygen -f "$HOME/.ssh/known_hosts" -R "$vm_spawn_ip"
+
+
+    - name: prepare artifacts
+      id: prepare_artifacts
+      shell: bash
+      if: ${{ !cancelled() }}
+      run: |
+        echo "get vm shutdown flag from profile"
+        shutdown_flag=$(yq '.${{ inputs.vm_profile}}.shutdown_flag'  $HOME/.kcli/profiles.yml)
+        vm_client=$(yq '.${{ inputs.vm_profile}}.client'  $HOME/.kcli/profiles.yml)
+        echo "shutdown flag:" $shutdown_flag
+        echo "vm client: " $vm_client
+        if [[ $shutdown_flag == "false" ]]; then
+          echo "prepare artifacts"
+          tar -cf ${{ github.workspace }}/${{ github.run_id }}_artifacts.tar -C $HOME/.ssh ${{ github.run_id }}_ubuntu
+          echo $vm_uname >> ${{ github.workspace }}/${{ github.run_id }}_vm_info
+          echo "=========================" >> ${{ github.workspace }}/${{ github.run_id }}_vm_info
+          echo $vm_spawn_ip >> ${{ github.workspace }}/${{ github.run_id }}_vm_info
+          tar -rf ${{ github.workspace }}/${{ github.run_id }}_artifacts.tar -C ${{ github.workspace }} ${{ github.run_id }}_vm_info
+          rm $HOME/.ssh/${{ github.run_id }}_ubuntu*
+        fi
+
+    - name: upload artifacts
+      uses: actions/upload-artifact@v3
+      if: ${{ !cancelled() }}
+      with:
+        name: ${{ github.run_id }}_artifacts
+        path: ${{ github.workspace }}/${{ github.run_id }}_artifacts.tar
+
+
+
